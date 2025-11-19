@@ -1,0 +1,160 @@
+### FastAPI Buffer API – Complete Design & Step-by-Step Implementation Plan (No Code)
+
+This buffer will be a **lightweight, native Windows FastAPI service** that acts as the single orchestration brain between your Telegram bot and the Dockerised code-generation engine.  
+It completely hides the internal details (localhost:3000, API keys, save paths, file system) from the Telegram bot, making the bot code extremely simple and future-proof.
+
+#### Core Design Principles
+
+1. **Single Source of Truth** – The buffer is the ONLY component that knows:
+   - The internal Automation API URL (localhost:3000)
+   - The API key for the Automation API
+   - The host path to your automations folder (e.g., D:\AI-Automations)
+   - How to translate user-friendly filenames ↔ container paths
+
+2. **Hybrid File Handling** (the key insight)
+   - Generation & saving → done inside Docker (via save_path = "/automations/script.py")
+   - Listing, reading, deleting, executing existing files → done by the buffer directly on the Windows file system (faster, no need to go through Docker)
+
+3. **User-Friendly API for the Telegram Bot**
+   The bot only needs to remember filenames like "backup.py", not full paths or container paths.
+   The buffer automatically:
+   - Adds timestamps or UUIDs to avoid overwrites
+   - Generates safe filenames from prompts
+   - Returns clean, ready-to-display responses
+
+4. **Security & Robustness**
+   - Optional simple API key between Telegram bot ↔ buffer
+   - Path traversal protection (only allow files under your automations folder)
+   - Comprehensive error messages that the bot can show the user
+   - Structured JSON responses
+
+5. **Final Endpoint List** (this is what you will implement)
+
+| Method | Endpoint                    | Purpose                                      | Key Parameters                          | Response                              |
+|--------|-----------------------------|----------------------------------------------|-----------------------------------------|---------------------------------------|
+| POST   | /generate                   | Generate + optionally save                   | prompt, model (opt), filename (opt)     | code, saved_filename, full raw        |
+| POST   | /generate-and-run           | Generate → save → immediately execute       | prompt, model, filename (opt)           | code, output, saved_filename          |
+| POST   | /run                        | Execute an existing script                   | filename                                | output, error (if any)                |
+| GET    | /list                       | List all saved automations                   | none                                    | array of filenames + metadata         |
+| POST   | /get                        | Return the content of a script               | filename                                | code                               |
+| POST   | /delete                     | Delete a script                              | filename                                | success message                       |
+| GET    | /health                     | Quick status check                           | none                                    | status of buffer + Docker API         |
+
+Optional future endpoints: /refine-prompt, /search-scripts, /rename, etc.
+
+#### Project Structure (Recommended)
+
+```
+C:\ai-buffer\
+├── main.py              # all FastAPI code in one file (clean for this size)
+├── config.py            # loads .env, defines constants
+├── utils.py             # safe filename generation, path validation
+├── .env                 # secrets and paths
+├── requirements.txt
+├── start-dev.bat        # uvicorn --reload
+├── start-prod.bat       # uvicorn no reload
+└── logs\ (optional)
+```
+
+#### Step-by-Step Implementation Plan
+
+**Step 1 – Project Setup**
+- Create the folder (e.g., C:\ai-buffer)
+- Create virtual environment: python -m venv venv → venv\Scripts\activate
+- Create requirements.txt with:
+  fastapi
+  uvicorn[standard]
+  python-dotenv
+  requests
+  pydantic
+  python-multipart (if you ever add file uploads)
+- pip install -r requirements.txt
+
+**Step 2 – Configuration (.env + config.py)**
+Create .env with:
+- AUTOMATION_API_URL=http://localhost:3000
+- AUTOMATION_API_KEY=your_key_from_the_automation_repo
+- AUTOMATIONS_HOST_DIR=D:\AI-Automations   # ← change to your real folder
+- BUFFER_PORT=8000
+- BUFFER_API_KEY=supersecret123           # optional key the Telegram bot must send
+- DEFAULT_MODEL=deepseek-coder:6.7b
+- MAX_FILENAME_LENGTH=100
+
+In config.py load these with dotenv and expose as constants.
+
+**Step 3 – Utility Functions (utils.py)**
+Create helpers for:
+- generate_safe_filename(prompt: str) → "backup_desktop_2025-11-19_14-32.py"
+- validate_and_join_path(filename: str) → full Windows path + reject ".." or absolute paths
+- get_container_path(host_path: str) → "/automations/script.py"
+
+**Step 4 – Pydantic Models**
+Define request/response models for every endpoint (keeps everything typed and gives perfect auto-docs at /docs)
+
+Example models:
+- GenerateRequest → prompt: str, model: str | None, filename: str | None
+- RunRequest → filename: str
+- StandardResponse → success: bool, message: str, data: any
+
+**Step 5 – Implement Endpoints (in order of priority)**
+
+1. Health check → GET /health
+   - Ping localhost:3000/health or /api/generate with tiny prompt
+   - Return status of Docker API
+
+2. Generate → POST /generate
+   - Accept prompt, optional model, optional filename
+   - If no filename → auto-generate from prompt + timestamp
+   - Construct container_path = f"/automations/{safe_filename}"
+   - Call Docker /api/generate with save_path included
+   - Return the code + actual saved filename
+
+3. Generate-and-Run → POST /generate-and-run
+   - Do the generate step above
+   - Then immediately call Docker /api/execute with the code
+   - Return both code and execution output
+
+4. Run → POST /run
+   - Validate filename exists on host
+   - Read file content from Windows path
+   - POST to Docker /api/execute with that code
+   - Stream or return full output
+
+5. List → GET /list
+   - os.listdir(AUTOMATIONS_HOST_DIR)
+   - Filter only .py files
+   - Return sorted by modified time, with size and date
+
+6. Get → POST /get
+   - Validate path
+   - Read file → return as text
+
+7. Delete → POST /delete
+   - Validate → os.remove → success
+
+**Step 6 – Shared Logic**
+- Every endpoint that talks to Docker must:
+   - Add Authorization header with the API key
+   - Have timeout (10–120s depending on task)
+   - Catch HTTP errors → convert to friendly message
+   - Log request/response (print or logging module)
+
+**Step 7 – Security**
+- Add optional middleware: check X-API-Key header == BUFFER_API_KEY
+- All file operations go through validate_and_join_path() — never trust user input
+
+**Step 8 – Error Handling & User Experience**
+- Use HTTP status codes properly (400, 404, 500)
+- Always return JSON with success/message/data
+- For long outputs → consider adding pagination or chunking later
+
+**Step 9 – Testing**
+- Run uvicorn main:app --reload --port 8000
+- Open http://localhost:8000/docs → test every endpoint manually
+- Create a Postman collection or simple Python script to simulate bot calls
+
+**Step 10 – Production Readying**
+- Create start-prod.bat with: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+- Optional: add Windows service via NSSM or just use Task Scheduler on boot
+- Add logging to file
+
